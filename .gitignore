@@ -1,0 +1,19 @@
+# build output
+.build/
+dist/
+bin/
+obj/
+out/
+
+# third-party binaries are downloaded by build/build.sh, never committed
+src/P2SVpn/payload/
+
+# VPN profiles and generated hosts lists contain secrets / internal names
+*.ovpn
+azurevpnconfig*.xml
+hosts.txt
+
+# editors
+.vs/
+.vscode/
+*.user

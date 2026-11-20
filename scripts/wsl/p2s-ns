@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# p2s-ns - run extra OpenP2S (Azure P2S / Entra ID) connections side by side,
+#          each inside its own Linux network namespace.
+#
+# Why: OpenP2S allows one connection per network namespace (its lock is an
+# abstract unix socket). A namespace per extra profile lifts that limit and
+# gives each tunnel its own routing table, so overlapping ranges don't clash.
+#
+# Layout per profile <name>:
+#   netns      p2s-<name>
+#   veth pair  p2s<N>h (host, 100.127.<N>.1/30) <-> p2s<N>n (ns, 100.127.<N>.2/30)
+#   NAT        host masquerades 100.127.0.0/16 out of any non-p2s interface
+#   runtime    $XDG_RUNTIME_DIR/p2s-<name>/openp2s  (session, lock record, mgmt socket)
+#   sign-in    shared ~/.local/state/openp2s cache, so it is silent after the first login
+#
+# Profiles are looked up as ~/vpn/<name>.xml unless P2S_PROFILE_DIR is set.
+#
+# Usage:
+#   p2s-ns up <name> [openp2s connect options]   connect (foreground; Ctrl+C disconnects)
+#   p2s-ns exec <name> <command...>             run a command through that VPN
+#   p2s-ns shell <name>                         open your shell inside that VPN
+#   p2s-ns route <name>                         also route its ranges from normal WSL
+#   p2s-ns unroute <name>                       remove those routes
+#   p2s-ns status                               show every namespace and its tunnel
+#   p2s-ns diag <name> [ip] [port]              troubleshoot reachability through that VPN
+#   p2s-ns proxy [port]                         SOCKS5 on 127.0.0.1:1080 for Windows apps
+#   p2s-ns down <name>                          disconnect and remove the namespace
+#   p2s-ns down-all                             same, for every p2s namespace
+
+set -euo pipefail
+
+PROFILE_DIR="${P2S_PROFILE_DIR:-$HOME/vpn}"
+STATE_DIR=/run/p2s-ns              # root-owned, tmpfs: index allocation per name
+NFT_TABLE=p2s_ns
+NS_PREFIX=p2s-
+NET_PREFIX=100.127                 # CGNAT space, unlikely to collide with Azure VNets
+RUNTIME_BASE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+ME="$(id -un)"
+
+die()  { printf 'p2s-ns: %s\n' "$*" >&2; exit 1; }
+info() { printf '==> %s\n' "$*"; }
+warn() { printf 'p2s-ns: warning: %s\n' "$*" >&2; }
+
+[[ $EUID -ne 0 ]] || die "run as your normal user, not root (it calls sudo itself)"
+
+valid_name() { [[ $1 =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "invalid name '$1' (use a-z, 0-9, -)"; }
+ns_of()      { printf '%s%s' "$NS_PREFIX" "$1"; }
+ns_exists()  { [[ -e /run/netns/$(ns_of "$1") ]]; }
+# Names of all p2s namespaces, one per line.
+p2s_names()  {
+    local f
+    for f in /run/netns/"$NS_PREFIX"*; do
+        [[ -e $f ]] && printf '%s\n' "${f##*/"$NS_PREFIX"}"
+    done
+    return 0
+}
+runtime_of() { printf '%s/p2s-%s' "$RUNTIME_BASE" "$1"; }
+
+profile_of() {
+    local p="$PROFILE_DIR/$1.xml"
+    [[ -f $p ]] || die "profile not found: $p"
+    printf '%s' "$p"
+}
+
+# Index N for a name: reuse if allocated, else lowest free 1..250.
+index_of() {
+    local name=$1 f="$STATE_DIR/$1"
+    if sudo test -f "$f"; then sudo cat "$f"; return; fi
+    local used n
+    used="$(sudo sh -c "cat $STATE_DIR/* 2>/dev/null" || true)"
+    for n in $(seq 1 250); do
+        grep -qx "$n" <<<"$used" || { printf '%s\n' "$n" | sudo tee "$f" >/dev/null; printf '%s' "$n"; return; }
+    done
+    die "no free namespace index"
+}
+
+# Run a command inside the namespace as you, with a per-profile runtime dir.
+ns_run_as_me() {
+    local name=$1; shift
+    local rt; rt="$(runtime_of "$name")"
+    sudo ip netns exec "$(ns_of "$name")" \
+        sudo -u "$ME" -- env \
+            XDG_RUNTIME_DIR="$rt" \
+            P2S_NS="$name" \
+            BROWSER="${BROWSER:-/mnt/c/Windows/explorer.exe}" \
+            "$@"
+}
+
+ensure_nat() {
+    sudo sysctl -qw net.ipv4.ip_forward=1
+    if ! sudo nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+        sudo nft -f - <<EOF
+table ip $NFT_TABLE {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr $NET_PREFIX.0.0/16 oifname != "p2s*" masquerade
+    }
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        iifname "p2s*" accept
+        oifname "p2s*" ct state established,related accept
+        oifname "p2s*" ip saddr != $NET_PREFIX.0.0/16 accept
+    }
+}
+EOF
+    fi
+    if sudo nft list ruleset 2>/dev/null | grep -Eq 'hook forward .*policy drop'; then
+        warn "another firewall table drops forwarded traffic; namespaces may have no internet"
+    fi
+}
+
+maybe_drop_nat() {
+    if [[ -z $(p2s_names) ]]; then
+        sudo nft delete table ip "$NFT_TABLE" 2>/dev/null || true
+    fi
+}
+
+setup_ns() {
+    local name=$1 ns n host_if ns_if
+    ns="$(ns_of "$name")"
+    sudo install -d -m 755 "$STATE_DIR"
+    n="$(index_of "$name")"
+    host_if="p2s${n}h"; ns_if="p2s${n}n"
+
+    ensure_nat
+
+    if ! ns_exists "$name"; then
+        info "creating namespace $ns ($NET_PREFIX.$n.0/30)"
+        sudo ip netns add "$ns"
+        sudo ip link add "$host_if" type veth peer name "$ns_if"
+        sudo ip link set "$ns_if" netns "$ns"
+        sudo ip addr add "$NET_PREFIX.$n.1/30" dev "$host_if"
+        sudo ip link set "$host_if" up
+        sudo ip -n "$ns" link set lo up
+        sudo ip -n "$ns" addr add "$NET_PREFIX.$n.2/30" dev "$ns_if"
+        sudo ip -n "$ns" link set "$ns_if" up
+        sudo ip -n "$ns" route add default via "$NET_PREFIX.$n.1"
+        # Let the namespace forward + NAT into its tunnel, for `p2s-ns route`.
+        sudo ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=1
+        sudo ip netns exec "$ns" nft -f - <<EOF
+table ip p2s_ns_inner {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "tun*" masquerade
+    }
+}
+EOF
+    fi
+
+    # DNS for tools that read resolv.conf directly. (glibc lookups go through
+    # systemd-resolved's socket and keep working regardless.)
+    local hostns
+    hostns="$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null || true)"
+    sudo install -d -m 755 "/etc/netns/$ns"
+    {
+        [[ -n $hostns ]] && printf 'nameserver %s\n' "$hostns"
+        printf 'nameserver 1.1.1.1\n'
+    } | sudo tee "/etc/netns/$ns/resolv.conf" >/dev/null
+
+    install -d -m 700 "$(runtime_of "$name")"
+}
+
+cmd_up() {
+    local name=${1:-}; [[ -n $name ]] || die "usage: p2s-ns up <name> [openp2s options]"
+    valid_name "$name"; shift
+    local profile; profile="$(profile_of "$name")"
+    sudo -v
+    setup_ns "$name"
+
+    if ! ns_run_as_me "$name" ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then
+        warn "namespace $(ns_of "$name") cannot reach the internet; the connect will likely fail"
+    fi
+
+    info "connecting $name inside $(ns_of "$name") (Ctrl+C to disconnect)"
+    # --no-dns: systemd-resolved runs in the main namespace and can't manage
+    # a tunnel interface that lives in another one.
+    ns_run_as_me "$name" openp2s connect --no-dns "$profile" "$@"
+}
+
+cmd_exec() {
+    local name=${1:-}; [[ -n $name ]] || die "usage: p2s-ns exec <name> <command...>"
+    valid_name "$name"; shift
+    [[ $# -gt 0 ]] || die "usage: p2s-ns exec <name> <command...>"
+    ns_exists "$name" || die "namespace for '$name' is not up (p2s-ns up $name)"
+    ns_run_as_me "$name" "$@"
+}
+
+cmd_shell() {
+    local name=${1:-}; [[ -n $name ]] || die "usage: p2s-ns shell <name>"
+    valid_name "$name"
+    ns_exists "$name" || die "namespace for '$name' is not up (p2s-ns up $name)"
+    info "shell inside $(ns_of "$name"); exit to leave"
+    ns_run_as_me "$name" "${SHELL:-/bin/bash}" -l
+}
+
+# Ranges the tunnel in the namespace routes (excluding its own client pool).
+tunnel_ranges() {
+    local ns; ns="$(ns_of "$1")"
+    sudo ip -n "$ns" -4 route show 2>/dev/null \
+        | awk '$0 ~ / dev tun[0-9]+/ && $0 !~ /proto kernel/ {print $1}'
+}
+
+cmd_route() {
+    local name=${1:-}; [[ -n $name ]] || die "usage: p2s-ns route <name>"
+    valid_name "$name"
+    ns_exists "$name" || die "namespace for '$name' is not up"
+    local n gw ranges r existing added=0
+    n="$(index_of "$name")"; gw="$NET_PREFIX.$n.2"
+    ranges="$(tunnel_ranges "$name")"
+    [[ -n $ranges ]] || die "no tunnel routes in $(ns_of "$name") yet; is it connected?"
+    while read -r r; do
+        [[ -n $r ]] || continue
+        existing="$(ip -4 route show exact "$r" 2>/dev/null)"
+        if [[ -n $existing && $existing != *"via $gw "* ]]; then
+            warn "skip $r: already routed in WSL ($existing). Use: p2s-ns exec $name ..."
+            continue
+        fi
+        sudo ip route replace "$r" via "$gw"
+        printf '  %s -> %s\n' "$r" "$name"; added=$((added+1))
+    done <<<"$ranges"
+    info "$added range(s) now reach $name from normal WSL"
+}
+
+cmd_unroute() {
+    local name=${1:-}; [[ -n $name ]] || die "usage: p2s-ns unroute <name>"
+    valid_name "$name"
+    sudo test -f "$STATE_DIR/$name" || return 0
+    local gw r; gw="$NET_PREFIX.$(sudo cat "$STATE_DIR/$name").2"
+    ip -4 route show | awk -v gw="$gw" '$2=="via" && $3==gw {print $1}' | while read -r r; do
+        sudo ip route del "$r" via "$gw" && printf '  removed %s\n' "$r"
+    done
+}
+
+cmd_status() {
+    local names name
+    names="$(p2s_names)"
+    echo "## main WSL namespace"
+    openp2s status 2>&1 | sed 's/^/   /' || true
+    [[ -n $names ]] || { echo; echo "(no p2s namespaces)"; return 0; }
+    sudo -v
+    for name in $names; do
+        echo; echo "## $name  (netns $(ns_of "$name"))"
+        ns_run_as_me "$name" openp2s status 2>&1 | sed 's/^/   /' || true
+    done
+}
+
+tun_counters() {  # "rx_packets tx_packets" of tun0 inside the namespace
+    local ns; ns="$(ns_of "$1")"
+    sudo ip netns exec "$ns" sh -c \
+        'printf "%s %s" "$(cat /sys/class/net/tun0/statistics/rx_packets)" "$(cat /sys/class/net/tun0/statistics/tx_packets)"' \
+        2>/dev/null || printf '? ?'
+}
+
+tcp_probe() {  # tcp_probe <where: ns-name|main> <ip> <port>
+    local where=$1 ip=$2 port=$3 cmd
+    cmd="timeout 4 bash -c '</dev/tcp/$ip/$port' 2>/dev/null && echo open || echo 'no answer'"
+    if [[ $where == main ]]; then bash -c "$cmd"; else ns_run_as_me "$where" bash -c "$cmd"; fi
+}
+
+cmd_diag() {
+    local name=${1:-} ip=${2:-} port=${3:-}
+    [[ -n $name ]] || die "usage: p2s-ns diag <name> [target-ip] [tcp-port]"
+    valid_name "$name"
+    ns_exists "$name" || die "namespace for '$name' is not up"
+    sudo -v
+    local ns n c0 c1 c2; ns="$(ns_of "$name")"; n="$(sudo cat "$STATE_DIR/$name")"
+
+    echo "## $name: interfaces and routes inside $ns"
+    sudo ip -n "$ns" -br addr | sed 's/^/   /'
+    sudo ip -n "$ns" -4 route | sed 's/^/   /'
+    echo "   ip_forward in ns: $(sudo ip netns exec "$ns" cat /proc/sys/net/ipv4/ip_forward)"
+    echo "   inner NAT table:  $(sudo ip netns exec "$ns" nft list table ip p2s_ns_inner >/dev/null 2>&1 && echo present || echo MISSING)"
+    echo "   host NAT table:   $(sudo nft list table ip "$NFT_TABLE" >/dev/null 2>&1 && echo present || echo MISSING)"
+    echo "   host ip_forward:  $(cat /proc/sys/net/ipv4/ip_forward)"
+    echo
+    echo "## OpenVPN in $ns"
+    ns_run_as_me "$name" openp2s status 2>&1 | grep -E '^(Connected|Reconnecting|Not connected|warning)|Uptime|Address' | sed 's/^/   /' || true
+    echo "   last log lines:"
+    sudo tail -n 8 "$(runtime_of "$name")/openp2s/openvpn.log" 2>/dev/null | sed 's/^/     /' || echo "     (no openvpn.log)"
+
+    c0="$(tun_counters "$name")"
+    echo
+    echo "## tun0 counters (rx tx) before tests: $c0"
+    [[ -n $ip ]] || { echo; echo "(pass a target IP, and optionally a TCP port, to run reachability tests)"; return 0; }
+
+    echo
+    echo "## from INSIDE $ns -> $ip"
+    ns_run_as_me "$name" ping -c3 -W2 "$ip" 2>&1 | tail -n 2 | sed 's/^/   /' || true
+    [[ -n $port ]] && echo "   tcp/$port: $(tcp_probe "$name" "$ip" "$port")"
+    c1="$(tun_counters "$name")"
+    echo "   tun0 counters now: $c1"
+
+    echo
+    echo "## from NORMAL WSL -> $ip"
+    echo "   route: $(ip -4 route get "$ip" 2>&1 | head -n1)"
+    ping -c3 -W2 "$ip" 2>&1 | tail -n 2 | sed 's/^/   /' || true
+    [[ -n $port ]] && echo "   tcp/$port: $(tcp_probe main "$ip" "$port")"
+    c2="$(tun_counters "$name")"
+    echo "   tun0 counters now: $c2"
+    echo
+    echo "How to read this: tx rising but rx flat = packets leave through the tunnel"
+    echo "and nothing returns (target firewall / NSG, wrong IP, or gateway not routing)."
+    echo "Neither rising from normal WSL = the host -> namespace hop is the problem."
+}
+
+# SOCKS5 proxy in the MAIN WSL namespace. With `p2s-ns route <name>` in place it
+# reaches every routed VPN, and with WSL's mirrored networking Windows can use it
+# at 127.0.0.1:<port>.
+cmd_proxy() {
+    local port=${1:-1080}
+    command -v microsocks >/dev/null || die "microsocks is not installed (sudo pacman -S microsocks)"
+    [[ -n $(ip -4 route show | grep ' dev p2s') ]] || warn "no routes into p2s namespaces yet; run 'p2s-ns route <name>' first"
+    info "SOCKS5 proxy on 127.0.0.1:$port (Ctrl+C to stop)"
+    exec microsocks -i 127.0.0.1 -p "$port"
+}
+
+cmd_down() {
+    local name=${1:-}; [[ -n $name ]] || die "usage: p2s-ns down <name>"
+    valid_name "$name"
+    sudo -v
+    cmd_unroute "$name" || true
+    if ns_exists "$name"; then
+        info "disconnecting $name"
+        ns_run_as_me "$name" openp2s disconnect 2>&1 | sed 's/^/   /' || true
+        sudo ip netns del "$(ns_of "$name")"   # also removes the veth pair
+    fi
+    sudo rm -rf "/etc/netns/$(ns_of "$name")"
+    sudo rm -f "$STATE_DIR/$name"
+    rm -rf "$(runtime_of "$name")"
+    maybe_drop_nat
+    info "$name removed"
+}
+
+cmd_down_all() {
+    local name
+    for name in $(p2s_names); do
+        cmd_down "$name"
+    done
+    maybe_drop_nat
+}
+
+usage() { sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"; }
+
+case "${1:-}" in
+    up)        shift; cmd_up "$@" ;;
+    exec)      shift; cmd_exec "$@" ;;
+    shell)     shift; cmd_shell "$@" ;;
+    route)     shift; cmd_route "$@" ;;
+    unroute)   shift; cmd_unroute "$@" ;;
+    status)    shift; cmd_status ;;
+    diag)      shift; cmd_diag "$@" ;;
+    proxy)     shift; cmd_proxy "$@" ;;
+    down)      shift; cmd_down "$@" ;;
+    down-all)  shift; cmd_down_all ;;
+    -h|--help|help|"") usage ;;
+    *) die "unknown command '$1' (see p2s-ns --help)" ;;
+esac
