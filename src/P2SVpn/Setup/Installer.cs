@@ -20,8 +20,35 @@ internal static class Installer
     public static bool IsAdmin() =>
         new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
 
-    public static bool ServiceExists() =>
-        ServiceController.GetServices().Any(s => s.ServiceName.Equals(AppPaths.ServiceName, StringComparison.OrdinalIgnoreCase));
+    // ---- service control via sc.exe ------------------------------------------
+    // ServiceController throws in half-removed states (e.g. a service "marked for
+    // deletion" by an earlier uninstall still enumerates but cannot be opened), so
+    // setup talks to the Service Control Manager through sc.exe and its exit codes.
+    private enum SvcState { Missing, Stopped, Running, Pending, Unknown }
+
+    private const int ErrServiceDoesNotExist = 1060;
+    private const int ErrServiceAlreadyRunning = 1056;
+    private const int ErrServiceNotActive = 1062;
+    private const int ErrServiceMarkedForDelete = 1072;
+    private const int ErrServiceExists = 1073;
+
+    private static (SvcState State, int Pid, string Raw) QueryService()
+    {
+        var (code, output) = SystemTools.Run("sc.exe", ["queryex", AppPaths.ServiceName]);
+        if (code == ErrServiceDoesNotExist) return (SvcState.Missing, 0, output);
+        if (code != 0) return (SvcState.Unknown, 0, output);
+        var st = System.Text.RegularExpressions.Regex.Match(output, @"STATE\s*:\s*(\d+)");
+        var pid = System.Text.RegularExpressions.Regex.Match(output, @"PID\s*:\s*(\d+)");
+        int p = pid.Success ? int.Parse(pid.Groups[1].Value) : 0;
+        return st.Success ? (st.Groups[1].Value switch { "1" => SvcState.Stopped, "4" => SvcState.Running, _ => SvcState.Pending }, p, output)
+                          : (SvcState.Unknown, p, output);
+    }
+
+    public static bool ServiceExists() => QueryService().State != SvcState.Missing;
+
+    private static InvalidOperationException RebootNeeded() => new(
+        "Windows is still removing an older P2S VPN service from this PC.\n\n" +
+        "Restart the computer, then run P2S VPN setup again.");
 
     public static string? InstalledVersion()
     {
@@ -110,18 +137,8 @@ internal static class Installer
             }
 
             // Service.
-            var bin = $"\"{AppPaths.InstalledExe}\" --service";
-            if (ServiceExists())
-                Sc(["config", AppPaths.ServiceName, "binPath=", bin, "start=", "auto"]);
-            else
-                Sc(["create", AppPaths.ServiceName, "binPath=", bin, "start=", "auto", "DisplayName=", AppPaths.ServiceDisplayName]);
-            Sc(["description", AppPaths.ServiceName, "Runs Azure Point-to-Site VPN tunnels for the P2S VPN app."]);
-            Sc(["failure", AppPaths.ServiceName, "reset=", "86400", "actions=", "restart/5000/restart/5000/restart/30000"]);
-            using (var sc = new ServiceController(AppPaths.ServiceName))
-            {
-                sc.Start();
-                sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(20));
-            }
+            InstallOrUpdateService();
+            StartService();
             Log("service running");
 
             // Start menu + Apps & Features.
@@ -157,7 +174,7 @@ internal static class Installer
         {
             Log("uninstall");
             StopServiceIfRunning();
-            if (ServiceExists()) Sc(["delete", AppPaths.ServiceName]);
+            if (QueryService().State != SvcState.Missing) Sc(["delete", AppPaths.ServiceName]);
             KillOtherInstances();
             Nrpt.Remove(null);
             foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
@@ -183,25 +200,90 @@ internal static class Installer
         }
     }
 
-    private static void Sc(string[] args)
+    private static int Sc(string[] args)
     {
         var (code, output) = SystemTools.Run("sc.exe", args);
         Log($"sc {args[0]} -> {code} {output.Replace("\r", " ").Replace("\n", " ")}");
-        if (code != 0 && args[0] is "create" or "config")
-            throw new InvalidOperationException($"sc {args[0]} failed ({code}): {output}");
+        return code;
     }
 
+    private static void InstallOrUpdateService()
+    {
+        var bin = $"\"{AppPaths.InstalledExe}\" --service";
+        var state = QueryService();
+        Log($"service before install: {state.State}");
+
+        int code;
+        if (state.State == SvcState.Missing)
+        {
+            code = Sc(["create", AppPaths.ServiceName, "binPath=", bin, "start=", "auto", "DisplayName=", AppPaths.ServiceDisplayName]);
+            // Listed as missing but the name is taken: fall back to updating it.
+            if (code == ErrServiceExists) code = Sc(["config", AppPaths.ServiceName, "binPath=", bin, "start=", "auto", "DisplayName=", AppPaths.ServiceDisplayName]);
+        }
+        else
+        {
+            code = Sc(["config", AppPaths.ServiceName, "binPath=", bin, "start=", "auto", "DisplayName=", AppPaths.ServiceDisplayName]);
+        }
+        if (code == ErrServiceMarkedForDelete) throw RebootNeeded();
+        if (code != 0) throw new InvalidOperationException($"Could not register the P2S VPN service (sc error {code}). See {Path.Combine(AppPaths.DataDir, "install.log")}");
+
+        Sc(["description", AppPaths.ServiceName, "Runs Azure Point-to-Site VPN tunnels for the P2S VPN app."]);
+        Sc(["failure", AppPaths.ServiceName, "reset=", "86400", "actions=", "restart/5000/restart/5000/restart/30000"]);
+    }
+
+    private static void StartService()
+    {
+        var code = Sc(["start", AppPaths.ServiceName]);
+        if (code == ErrServiceMarkedForDelete) throw RebootNeeded();
+        if (code != 0 && code != ErrServiceAlreadyRunning)
+            Log($"sc start returned {code}; waiting for the service anyway");
+
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < deadline)
+        {
+            var s = QueryService();
+            if (s.State == SvcState.Running) return;
+            if (s.State == SvcState.Stopped && code is not 0 and not ErrServiceAlreadyRunning) break;
+            Thread.Sleep(500);
+        }
+        var last = QueryService();
+        throw new InvalidOperationException(
+            $"The P2S VPN service did not start ({last.State}, sc start {code}). " +
+            $"See {Path.Combine(AppPaths.DataDir, "install.log")} and Windows Event Viewer > Application.");
+    }
+
+    /// <summary>Stop the service if it runs; never throws (setup must get past a broken old install).</summary>
     private static void StopServiceIfRunning()
     {
-        if (!ServiceExists()) return;
-        using var sc = new ServiceController(AppPaths.ServiceName);
-        if (sc.Status is ServiceControllerStatus.Stopped or ServiceControllerStatus.StopPending) return;
         try
         {
-            sc.Stop();
-            sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+            var s = QueryService();
+            Log($"service state: {s.State}");
+            if (s.State is SvcState.Missing or SvcState.Stopped) return;
+
+            var code = Sc(["stop", AppPaths.ServiceName]);
+            if (code == ErrServiceNotActive) return;
+
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (DateTime.UtcNow < deadline)
+            {
+                var now = QueryService();
+                if (now.State is SvcState.Stopped or SvcState.Missing) return;
+                Thread.Sleep(500);
+            }
+
+            // Stuck: end the service process so its files can be replaced.
+            var stuck = QueryService();
+            if (stuck.Pid > 0)
+            {
+                Log($"service did not stop; ending pid {stuck.Pid}");
+                try { Process.GetProcessById(stuck.Pid).Kill(true); } catch { }
+            }
         }
-        catch { }
+        catch (Exception e)
+        {
+            Log("stop service: " + e.Message);
+        }
     }
 
     /// <summary>Close copies of the installed app (they lock the exe); never the setup that launched us.</summary>
