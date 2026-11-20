@@ -562,7 +562,7 @@ internal sealed class MainForm : Form
     }
 
     private static string ServiceError(string? e) => e == "SERVICE_UNAVAILABLE"
-        ? "The P2S VPN service is not running. Restart the computer, or run the P2S VPN setup again."
+        ? "The P2S VPN service is not running. Restart the computer, or run the P2S VPN setup again.\n\n" + Setup.Installer.AntivirusHint
         : e ?? "Unknown error.";
 
     // ======================================================================== polling
@@ -662,7 +662,8 @@ internal sealed class MainForm : Form
         _tray.Icon = UiKit.MakeIcon(up > 0 ? Theme.Green : busy > 0 ? Theme.Amber : Theme.Gray);
         var tip = up > 0 ? $"{AppPaths.AppName}: {up} connected" : AppPaths.AppName;
         _tray.Text = tip.Length > 63 ? tip[..63] : tip;
-        _svcLabel.Text = _serviceUp ? "●  Service running" : "●  The P2S VPN service is not running";
+        _svcLabel.Text = _serviceUp ? "●  Service running"
+            : "●  The P2S VPN service is not running. Antivirus (e.g. Kaspersky) may be blocking it: allow C:\\Program Files\\P2SVpn, then run setup again.";
         _svcLabel.ForeColor = _serviceUp ? Theme.Muted : Theme.Red;
 
         RenderDetail();

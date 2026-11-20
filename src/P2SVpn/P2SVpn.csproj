@@ -9,7 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>P2SVpn</RootNamespace>
     <AssemblyName>P2SVpn</AssemblyName>
-    <Version>1.1.1</Version>
+    <Version>1.1.2</Version>
     <Product>P2S VPN</Product>
     <Description>Azure Point-to-Site VPN (Entra ID), several profiles at once</Description>
     <ApplicationManifest>app.manifest</ApplicationManifest>

@@ -107,6 +107,7 @@ internal static class Installer
             // Files.
             if (!RunningFromInstallDir()) File.Copy(Environment.ProcessPath!, AppPaths.InstalledExe, true);
             ExtractResource("payload.openvpn.exe", AppPaths.OpenVpnExe);
+            VerifyFilesPresent();
             Log("files copied");
 
             // TAP-Windows6 driver + tapctl.exe, from the official signed OpenVPN installer.
@@ -213,22 +214,64 @@ internal static class Installer
         var state = QueryService();
         Log($"service before install: {state.State}");
 
+        string[] create = ["create", AppPaths.ServiceName, "binPath=", bin, "start=", "auto", "DisplayName=", AppPaths.ServiceDisplayName];
+        string[] config = ["config", AppPaths.ServiceName, "binPath=", bin, "start=", "auto", "DisplayName=", AppPaths.ServiceDisplayName];
+
         int code;
         if (state.State == SvcState.Missing)
         {
-            code = Sc(["create", AppPaths.ServiceName, "binPath=", bin, "start=", "auto", "DisplayName=", AppPaths.ServiceDisplayName]);
+            code = Sc(create);
             // Listed as missing but the name is taken: fall back to updating it.
-            if (code == ErrServiceExists) code = Sc(["config", AppPaths.ServiceName, "binPath=", bin, "start=", "auto", "DisplayName=", AppPaths.ServiceDisplayName]);
+            if (code == ErrServiceExists) code = Sc(config);
         }
         else
         {
-            code = Sc(["config", AppPaths.ServiceName, "binPath=", bin, "start=", "auto", "DisplayName=", AppPaths.ServiceDisplayName]);
+            code = Sc(config);
         }
         if (code == ErrServiceMarkedForDelete) throw RebootNeeded();
-        if (code != 0) throw new InvalidOperationException($"Could not register the P2S VPN service (sc error {code}). See {Path.Combine(AppPaths.DataDir, "install.log")}");
+
+        if (code != 0 || ServiceKey(writable: false) is null)
+        {
+            // Half-removed service: still listed by the Service Control Manager but its
+            // registry key is gone (sc config fails with 2 "file not found"). Security
+            // software that rolls back "suspicious" changes is the usual cause.
+            Log($"service registration is broken (sc {code}); deleting and recreating it");
+            Sc(["delete", AppPaths.ServiceName]);
+            var until = DateTime.UtcNow.AddSeconds(10);
+            while (QueryService().State != SvcState.Missing && DateTime.UtcNow < until) Thread.Sleep(500);
+            if (QueryService().State != SvcState.Missing) throw RebootNeeded();
+            code = Sc(create);
+            if (code == ErrServiceMarkedForDelete || code == ErrServiceExists) throw RebootNeeded();
+            if (code != 0) throw new InvalidOperationException($"Could not register the P2S VPN service (sc error {code}).\n\n{AntivirusHint}");
+        }
 
         Sc(["description", AppPaths.ServiceName, "Runs Azure Point-to-Site VPN tunnels for the P2S VPN app."]);
         Sc(["failure", AppPaths.ServiceName, "reset=", "86400", "actions=", "restart/5000/restart/5000/restart/30000"]);
+
+        // The single-file exe unpacks native runtime files on start. For SYSTEM that would
+        // be C:\Windows\Temp, where antivirus often blocks loading DLLs; use Program Files.
+        var extract = Path.Combine(AppPaths.InstallDir, ".net");
+        Directory.CreateDirectory(extract);
+        using var key = ServiceKey(writable: true)
+            ?? throw new InvalidOperationException("The P2S VPN service was registered but its settings disappeared from the registry.\n\n" + AntivirusHint);
+        key.SetValue("Environment", new[] { $"DOTNET_BUNDLE_EXTRACT_BASE_DIR={extract}" }, RegistryValueKind.MultiString);
+    }
+
+    private static RegistryKey? ServiceKey(bool writable) =>
+        Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Services\{AppPaths.ServiceName}", writable);
+
+    public const string AntivirusHint =
+        "If antivirus software is installed (for example Kaspersky), it may have blocked or rolled back P2S VPN. " +
+        "Allow / exclude \"C:\\Program Files\\P2SVpn\" and \"C:\\ProgramData\\P2SVpn\" (or mark P2SVpn.exe and openvpn.exe as trusted), " +
+        "check its quarantine, then run setup again.";
+
+    /// <summary>Antivirus can quarantine a freshly copied exe a moment later; check before going on.</summary>
+    private static void VerifyFilesPresent()
+    {
+        Thread.Sleep(1500);
+        foreach (var f in new[] { AppPaths.InstalledExe, AppPaths.OpenVpnExe })
+            if (!File.Exists(f))
+                throw new InvalidOperationException($"{f} was removed right after it was copied.\n\n{AntivirusHint}");
     }
 
     private static void StartService()
@@ -247,9 +290,12 @@ internal static class Installer
             Thread.Sleep(500);
         }
         var last = QueryService();
+        var exit = System.Text.RegularExpressions.Regex.Match(last.Raw, @"WIN32_EXIT_CODE\s*:\s*(\d+)");
+        Log($"service not running: {last.Raw.Replace("\r", " ").Replace("\n", " ")}");
         throw new InvalidOperationException(
-            $"The P2S VPN service did not start ({last.State}, sc start {code}). " +
-            $"See {Path.Combine(AppPaths.DataDir, "install.log")} and Windows Event Viewer > Application.");
+            $"The P2S VPN service did not start ({last.State}, sc start {code}{(exit.Success ? $", exit code {exit.Groups[1].Value}" : "")}).\n\n" +
+            (File.Exists(AppPaths.InstalledExe) ? "" : $"{AppPaths.InstalledExe} is missing.\n\n") +
+            AntivirusHint);
     }
 
     /// <summary>Stop the service if it runs; never throws (setup must get past a broken old install).</summary>
